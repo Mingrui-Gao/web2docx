@@ -1,14 +1,13 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 import convertapi
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore
 import tempfile
-import shutil
 import logging
 
 # Configure ConvertAPI
@@ -20,41 +19,110 @@ api_semaphore = Semaphore(20)
 # Configure logging to suppress some warnings
 logging.getLogger('streamlit').setLevel(logging.ERROR)
 
+def detect_product_links(url, soup):
+    """Detect product links based on common patterns"""
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc
+    product_links = set()
+    
+    # Strategy 1: Look for common product URL patterns
+    product_patterns = [
+        '/products/',
+        '/product/',
+        '/item/',
+        '/goods/',
+        'item_detail.php',
+        'product_detail.php',
+        'goods_view.php',
+        'shop_detail.php'
+    ]
+    
+    # Strategy 2: For Korean sites, look for specific parameters
+    korean_patterns = ['bno', 'no', 'idx', 'product_no', 'goods_no', 'item_no']
+    
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        full_url = urljoin(url, href)
+        parsed_link = urlparse(full_url)
+        
+        # Skip if different domain
+        if parsed_link.netloc and parsed_link.netloc != domain:
+            continue
+            
+        # Check for product patterns in URL
+        for pattern in product_patterns:
+            if pattern in full_url:
+                product_links.add(full_url)
+                break
+        
+        # Check for Korean site patterns (query parameters)
+        query_params = parse_qs(parsed_link.query)
+        for param in korean_patterns:
+            if param in query_params:
+                product_links.add(full_url)
+                break
+    
+    # If no products found, try to find links with images inside them
+    if not product_links:
+        st.info("No standard product links found. Looking for alternative patterns...")
+        
+        # Look for links containing product images
+        for link in soup.find_all('a', href=True):
+            if link.find('img') and ('product' in str(link).lower() or 'item' in str(link).lower()):
+                full_url = urljoin(url, link['href'])
+                if urlparse(full_url).netloc == domain:
+                    product_links.add(full_url)
+        
+        # Look for links in common product containers
+        for container in soup.find_all(['div', 'li', 'article'], class_=lambda x: x and any(
+            keyword in str(x).lower() for keyword in ['product', 'item', 'goods', '상품'])):
+            for link in container.find_all('a', href=True):
+                full_url = urljoin(url, link['href'])
+                if urlparse(full_url).netloc == domain and full_url != url:
+                    product_links.add(full_url)
+    
+    return sorted(list(product_links))
+
 def get_product_links(url):
     """Extract all product links from the collection page"""
     try:
-        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers)
         response.raise_for_status()
+        
+        # Handle encoding for Korean sites
+        if 'euc-kr' in response.headers.get('Content-Type', '').lower():
+            response.encoding = 'euc-kr'
+        elif not response.encoding:
+            response.encoding = 'utf-8'
+        
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        product_links = set()
+        # Try to detect product links
+        product_links = detect_product_links(url, soup)
         
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            full_url = urljoin(url, href)
-            parsed_url = urlparse(full_url)
-            
-            # Check if it's a product URL from the same domain
-            if parsed_url.netloc == urlparse(url).netloc and '/products/' in parsed_url.path:
-                product_links.add(full_url)
+        # Show debug info if requested
+        if st.checkbox("Show debug info"):
+            st.write(f"Found {len(product_links)} product links")
+            with st.expander("View detected links"):
+                for link in product_links[:10]:  # Show first 10
+                    st.code(link)
         
-        return sorted(list(product_links))
+        return product_links
     
     except requests.RequestException as e:
+        st.error(f"Error fetching page: {e}")
         return []
 
 def convert_url_to_pdf(url, output_dir, index):
     """Convert a single URL to PDF using ConvertAPI - NO Streamlit calls in threads"""
     with api_semaphore:
         try:
-            product_name = url.split('/')[-1]
-            filename = f"{index:03d}_{product_name}.pdf"
+            # Clean filename
+            filename = f"{index:03d}_product.pdf"
             filepath = os.path.join(output_dir, filename)
-            
-            # Test the URL first
-            test_response = requests.head(url, timeout=10)
-            if test_response.status_code != 200:
-                return {'success': False, 'error': f'URL not accessible (status: {test_response.status_code})', 'index': index}
             
             result = convertapi.convert('pdf', {
                 'Url': url,
@@ -63,7 +131,8 @@ def convert_url_to_pdf(url, output_dir, index):
                 'MarginBottom': '10',
                 'MarginLeft': '10',
                 'MarginRight': '10',
-                'Timeout': 30
+                'LoadLazyContent': 'true',  # Important for dynamic content
+                'WaitTime': '3'  # Wait for page to load
             }, from_format='web')
             
             result.file.save(filepath)
@@ -75,11 +144,6 @@ def convert_url_to_pdf(url, output_dir, index):
 def merge_pdfs(pdf_files, output_filename):
     """Merge all PDFs into one using ConvertAPI"""
     try:
-        # Verify all files exist
-        for pdf_file in pdf_files:
-            if not os.path.exists(pdf_file):
-                raise FileNotFoundError(f"PDF file not found: {pdf_file}")
-        
         result = convertapi.convert('merge', {
             'Files': pdf_files
         }, from_format='pdf')
@@ -88,14 +152,12 @@ def merge_pdfs(pdf_files, output_filename):
         return output_filename
         
     except Exception as e:
+        st.error(f"Error merging PDFs: {e}")
         return None
 
 def convert_pdf_to_docx(pdf_file, output_filename):
     """Convert PDF to Word DOCX using ConvertAPI"""
     try:
-        if not os.path.exists(pdf_file):
-            raise FileNotFoundError(f"PDF file not found: {pdf_file}")
-            
         result = convertapi.convert('docx', {
             'File': pdf_file
         }, from_format='pdf')
@@ -104,9 +166,10 @@ def convert_pdf_to_docx(pdf_file, output_filename):
         return output_filename
         
     except Exception as e:
+        st.error(f"Error converting PDF to DOCX: {e}")
         return None
 
-def process_collection(url, progress_bar, status_text):
+def process_collection(url, progress_bar, status_text, max_products=50):
     """Process entire collection and return the Word document"""
     with tempfile.TemporaryDirectory() as temp_dir:
         # Get product links
@@ -117,13 +180,18 @@ def process_collection(url, progress_bar, status_text):
             st.error("No product links found!")
             return None
         
+        # Limit products if needed
+        if len(product_links) > max_products:
+            st.warning(f"Found {len(product_links)} products. Processing only first {max_products}.")
+            product_links = product_links[:max_products]
+        
         status_text.text(f"Found {len(product_links)} products. Starting conversion...")
         
-        # Convert URLs to PDFs concurrently with reduced thread count
+        # Convert URLs to PDFs concurrently
         pdf_files = []
         failed_conversions = []
         
-        with ThreadPoolExecutor(max_workers=20) as executor:
+        with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_url = {
                 executor.submit(convert_url_to_pdf, url, temp_dir, i): (url, i) 
                 for i, url in enumerate(product_links, 1)
@@ -156,7 +224,7 @@ def process_collection(url, progress_bar, status_text):
                     st.text(f"... and {len(failed_conversions) - 10} more")
         
         if not pdf_files:
-            st.error("No PDFs were successfully created! Check the URLs and API credentials.")
+            st.error("No PDFs were successfully created!")
             return None
         
         st.success(f"Successfully converted {len(pdf_files)} out of {len(product_links)} products")
@@ -169,14 +237,12 @@ def process_collection(url, progress_bar, status_text):
         status_text.text("Merging PDFs...")
         merged_pdf = os.path.join(temp_dir, "merged.pdf")
         if not merge_pdfs(pdf_paths, merged_pdf):
-            st.error("Failed to merge PDFs")
             return None
         
         # Convert to DOCX
         status_text.text("Converting to Word document...")
         final_docx = os.path.join(temp_dir, "products.docx")
         if not convert_pdf_to_docx(merged_pdf, final_docx):
-            st.error("Failed to convert to Word document")
             return None
         
         # Read the file to return it
@@ -189,41 +255,33 @@ st.set_page_config(page_title="Product Collection Scraper", page_icon="📄")
 st.title("🛍️ Product Collection to Word Document")
 st.markdown("Convert any product collection page to a Word document")
 
-# Initialize session state for URL
-if 'selected_url' not in st.session_state:
-    st.session_state.selected_url = ""
-
-# Example URLs
-example_urls = [
-    "https://havnstore.com/collections/satisfy",
-    "https://havnstore.com/collections/new-arrivals",
-    "https://havnstore.com/collections/all"
-]
-
-# Add example URL buttons
-st.markdown("**Example URLs:**")
-col1, col2, col3 = st.columns(3)
-with col1:
-    if st.button("Use Example 1", key="btn1"):
-        st.session_state.selected_url = example_urls[0]
-with col2:
-    if st.button("Use Example 2", key="btn2"):
-        st.session_state.selected_url = example_urls[1]
-with col3:
-    if st.button("Use Example 3", key="btn3"):
-        st.session_state.selected_url = example_urls[2]
-
-# Input field - use session state value
+# Input field
 url = st.text_input(
-    "Enter collection URL:",
-    value=st.session_state.selected_url,
-    placeholder="https://havnstore.com/collections/satisfy",
-    help="Enter the URL of a product collection page"
+    "Enter collection/category URL:",
+    placeholder="https://example.com/collections/products",
+    help="Enter the URL of a product collection, category, or listing page"
 )
 
-# Update session state when URL changes
-if url != st.session_state.selected_url:
-    st.session_state.selected_url = url
+# Add example URLs including Korean sites
+st.markdown("**Example URLs:**")
+col1, col2 = st.columns(2)
+
+with col1:
+    st.markdown("**International:**")
+    if st.button("Satisfy Collection"):
+        url = "https://havnstore.com/collections/satisfy"
+    if st.button("HAVN New Arrivals"):
+        url = "https://havnstore.com/collections/new-arrivals"
+
+with col2:
+    st.markdown("**Korean Sites:**")
+    if st.button("Malbon Golf"):
+        url = "https://malbongolfkorea.com/shop/big_section.php?cno1=1573"
+
+# Advanced options
+with st.expander("⚙️ Advanced Options"):
+    max_products = st.number_input("Maximum products to convert", min_value=1, max_value=100, value=50)
+    st.markdown("**Note:** Limiting products can help with large collections")
 
 # Convert button
 if st.button("🚀 Convert to Word Document", type="primary"):
@@ -236,16 +294,15 @@ if st.button("🚀 Convert to Word Document", type="primary"):
         
         # Process the collection
         with st.spinner("Processing..."):
-            docx_content = process_collection(url, progress_bar, status_text)
+            docx_content = process_collection(url, progress_bar, status_text, max_products)
         
         if docx_content:
             elapsed_time = time.time() - start_time
             status_text.text(f"✅ Completed in {elapsed_time:.1f} seconds!")
             
-            # Extract domain name for filename
-            domain = urlparse(url).netloc.replace('www.', '').replace('.com', '')
-            collection_name = url.split('/')[-1]
-            filename = f"{domain}_{collection_name}_products.docx"
+            # Generate filename
+            domain = urlparse(url).netloc.replace('www.', '').split('.')[0]
+            filename = f"{domain}_products_{time.strftime('%Y%m%d_%H%M%S')}.docx"
             
             # Provide download button
             st.download_button(
@@ -262,12 +319,20 @@ if st.button("🚀 Convert to Word Document", type="primary"):
 # Instructions
 with st.expander("ℹ️ How to use"):
     st.markdown("""
-    1. Click on an example URL or enter your own collection URL
+    1. Enter a product collection/category URL
     2. Click "Convert to Word Document"
     3. Wait for the process to complete
     4. Download your Word document
     
-    **Note:** The process may take a few minutes depending on the number of products.
+    **Supported sites:**
+    - Shopify stores (products in /collections/)
+    - Korean shopping sites (various URL patterns)
+    - Most e-commerce sites with product listings
+    
+    **Tips:**
+    - Use the debug checkbox to see detected links
+    - Limit max products for large collections
+    - The process may take a few minutes depending on the number of products
     """)
 
 # Footer
