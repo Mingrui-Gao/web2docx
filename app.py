@@ -64,8 +64,6 @@ def detect_product_links(url, soup):
     
     # If no products found, try to find links with images inside them
     if not product_links:
-        st.info("No standard product links found. Looking for alternative patterns...")
-        
         # Look for links containing product images
         for link in soup.find_all('a', href=True):
             if link.find('img') and ('product' in str(link).lower() or 'item' in str(link).lower()):
@@ -102,13 +100,6 @@ def get_product_links(url):
         
         # Try to detect product links
         product_links = detect_product_links(url, soup)
-        
-        # Show debug info if requested
-        if st.checkbox("Show debug info"):
-            st.write(f"Found {len(product_links)} product links")
-            with st.expander("View detected links"):
-                for link in product_links[:10]:  # Show first 10
-                    st.code(link)
         
         return product_links
     
@@ -169,8 +160,8 @@ def convert_pdf_to_docx(pdf_file, output_filename):
         st.error(f"Error converting PDF to DOCX: {e}")
         return None
 
-def process_collection(url, progress_bar, status_text, max_products=50):
-    """Process entire collection and return the Word document"""
+def process_collection(url, progress_bar, status_text, max_products=50, output_format='docx'):
+    """Process entire collection and return the document"""
     with tempfile.TemporaryDirectory() as temp_dir:
         # Get product links
         status_text.text("Fetching product links...")
@@ -178,7 +169,7 @@ def process_collection(url, progress_bar, status_text, max_products=50):
         
         if not product_links:
             st.error("No product links found!")
-            return None
+            return None, None
         
         # Limit products if needed
         if len(product_links) > max_products:
@@ -225,7 +216,7 @@ def process_collection(url, progress_bar, status_text, max_products=50):
         
         if not pdf_files:
             st.error("No PDFs were successfully created!")
-            return None
+            return None, None
         
         st.success(f"Successfully converted {len(pdf_files)} out of {len(product_links)} products")
         
@@ -237,79 +228,128 @@ def process_collection(url, progress_bar, status_text, max_products=50):
         status_text.text("Merging PDFs...")
         merged_pdf = os.path.join(temp_dir, "merged.pdf")
         if not merge_pdfs(pdf_paths, merged_pdf):
-            return None
+            return None, None
         
-        # Convert to DOCX
+        # If user wants PDF, return it
+        if output_format == 'pdf':
+            with open(merged_pdf, 'rb') as f:
+                return f.read(), 'pdf'
+        
+        # Otherwise convert to DOCX
         status_text.text("Converting to Word document...")
         final_docx = os.path.join(temp_dir, "products.docx")
         if not convert_pdf_to_docx(merged_pdf, final_docx):
-            return None
+            return None, None
         
         # Read the file to return it
         with open(final_docx, 'rb') as f:
-            return f.read()
+            return f.read(), 'docx'
 
 # Streamlit UI
 st.set_page_config(page_title="Product Collection Scraper", page_icon="📄")
 
-st.title("🛍️ Product Collection to Word Document")
-st.markdown("Convert any product collection page to a Word document")
+st.title("🛍️ Product Collection to Document Converter")
+st.markdown("Convert any product collection page to Word or PDF document")
+
+# Initialize session state
+if 'url_input' not in st.session_state:
+    st.session_state.url_input = ""
 
 # Input field
 url = st.text_input(
     "Enter collection/category URL:",
+    value=st.session_state.url_input,
     placeholder="https://example.com/collections/products",
-    help="Enter the URL of a product collection, category, or listing page"
+    help="Enter the URL of a product collection, category, or listing page",
+    key="url_field"
 )
 
-# Add example URLs including Korean sites
+# Update session state
+st.session_state.url_input = url
+
+# Add example URLs
 st.markdown("**Example URLs:**")
 col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("**International:**")
     if st.button("Satisfy Collection"):
-        url = "https://havnstore.com/collections/satisfy"
+        st.session_state.url_input = "https://havnstore.com/collections/satisfy"
+        st.rerun()
     if st.button("HAVN New Arrivals"):
-        url = "https://havnstore.com/collections/new-arrivals"
+        st.session_state.url_input = "https://havnstore.com/collections/new-arrivals"
+        st.rerun()
 
 with col2:
     st.markdown("**Korean Sites:**")
     if st.button("Malbon Golf"):
-        url = "https://malbongolfkorea.com/shop/big_section.php?cno1=1573"
+        st.session_state.url_input = "https://malbongolfkorea.com/shop/big_section.php?cno1=1573"
+        st.rerun()
 
-# Advanced options
-with st.expander("⚙️ Advanced Options"):
-    max_products = st.number_input("Maximum products to convert", min_value=1, max_value=100, value=50)
-    st.markdown("**Note:** Limiting products can help with large collections")
+# Options section
+col1, col2 = st.columns(2)
+
+with col1:
+    output_format = st.radio(
+        "Output format:",
+        ["Word Document (.docx)", "PDF Document (.pdf)"],
+        index=0
+    )
+
+with col2:
+    max_products = st.number_input(
+        "Maximum products to convert", 
+        min_value=1, 
+        max_value=100, 
+        value=50,
+        help="Limit the number of products to convert (useful for large collections)"
+    )
 
 # Convert button
-if st.button("🚀 Convert to Word Document", type="primary"):
-    if url:
+if st.button("🚀 Convert to Document", type="primary"):
+    if st.session_state.url_input:
         start_time = time.time()
         
         # Create progress indicators
         progress_bar = st.progress(0)
         status_text = st.empty()
         
+        # Determine output format
+        format_choice = 'pdf' if 'PDF' in output_format else 'docx'
+        
         # Process the collection
         with st.spinner("Processing..."):
-            docx_content = process_collection(url, progress_bar, status_text, max_products)
+            content, file_format = process_collection(
+                st.session_state.url_input, 
+                progress_bar, 
+                status_text, 
+                max_products,
+                format_choice
+            )
         
-        if docx_content:
+        if content:
             elapsed_time = time.time() - start_time
             status_text.text(f"✅ Completed in {elapsed_time:.1f} seconds!")
             
             # Generate filename
-            domain = urlparse(url).netloc.replace('www.', '').split('.')[0]
-            filename = f"{domain}_products_{time.strftime('%Y%m%d_%H%M%S')}.docx"
+            domain = urlparse(st.session_state.url_input).netloc.replace('www.', '').split('.')[0]
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            
+            if file_format == 'pdf':
+                filename = f"{domain}_products_{timestamp}.pdf"
+                mime_type = "application/pdf"
+                button_label = "📥 Download PDF Document"
+            else:
+                filename = f"{domain}_products_{timestamp}.docx"
+                mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                button_label = "📥 Download Word Document"
             
             # Provide download button
             st.download_button(
-                label="📥 Download Word Document",
-                data=docx_content,
+                label=button_label,
+                data=content,
                 file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                mime=mime_type
             )
         else:
             st.error("Conversion failed. Please check the error messages above.")
@@ -319,10 +359,12 @@ if st.button("🚀 Convert to Word Document", type="primary"):
 # Instructions
 with st.expander("ℹ️ How to use"):
     st.markdown("""
-    1. Enter a product collection/category URL
-    2. Click "Convert to Word Document"
-    3. Wait for the process to complete
-    4. Download your Word document
+    1. Enter a product collection/category URL or click an example
+    2. Choose your preferred output format (Word or PDF)
+    3. Optionally adjust the maximum number of products
+    4. Click "Convert to Document"
+    5. Wait for the process to complete
+    6. Download your document
     
     **Supported sites:**
     - Shopify stores (products in /collections/)
@@ -330,9 +372,9 @@ with st.expander("ℹ️ How to use"):
     - Most e-commerce sites with product listings
     
     **Tips:**
-    - Use the debug checkbox to see detected links
-    - Limit max products for large collections
-    - The process may take a few minutes depending on the number of products
+    - PDF format preserves the exact layout and styling
+    - Word format allows for easy editing afterwards
+    - Limit products for faster processing of large collections
     """)
 
 # Footer
